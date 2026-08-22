@@ -102,3 +102,6 @@ sudo python3 diskcraft.py
 | **Table Initialization** | `Initialize-Disk -PartitionStyle` | `parted mklabel` |
 | **Partition Creation** | `New-Partition` | `parted mkpart` |
 | **exFAT Formatting** | `Format-Volume -AllocationUnitSize 16384` | `mkfs.exfat -s 32` |
+
+also dosnt use import os.py as its no longer a supported version
+
