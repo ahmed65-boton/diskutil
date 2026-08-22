@@ -13,10 +13,8 @@ import shutil
 import subprocess
 from typing import List, Optional, Dict, Any, Tuple
 
-ALLOC_UNIT_BYTES = 16 * 1024  # 16 KB fixed
 
-
-# ----------------------------- Mode Selection -----------------------------
+# ----------------------------- Mode & Spec Selection -----------------------------
 
 def select_target_os() -> str:
     """Prompt the user to choose target operating system mode."""
@@ -38,6 +36,32 @@ def select_target_os() -> str:
         if choice in ("2", "linux"):
             return "Linux"
         print("Invalid selection. Please type '1' for Windows or '2' for Linux.")
+
+
+def prompt_cluster_size() -> int:
+    """Prompt user to choose exFAT Allocation Unit Size (cluster size in bytes)."""
+    print("\nSelect exFAT Allocation Unit (Cluster Size):")
+    print(" [1] 16 KB   - Maximum compatibility (Dashcams, Cameras, Consoles, Embedded Devices)")
+    print(" [2] 32 KB   - Standard default for small/medium drives (< 32 GB)")
+    print(" [3] 128 KB  - Recommended for standard flash drives & external SSDs (Default)")
+    print(" [4] 512 KB  - Optimized for large media / 4K video files")
+    print(" [5] 1024 KB - Maximum performance for massive file transfers / backups")
+
+    mapping = {
+        "1": 16 * 1024,
+        "2": 32 * 1024,
+        "3": 128 * 1024,
+        "4": 512 * 1024,
+        "5": 1024 * 1024,
+    }
+
+    while True:
+        choice = input("\nSelect cluster size [1-5] (default: 3 [128 KB]): ").strip()
+        if not choice:
+            return 128 * 1024  # 128 KB default
+        if choice in mapping:
+            return mapping[choice]
+        print("Invalid selection. Choose a option from 1 to 5.")
 
 
 # ----------------------------- System Helpers -----------------------------
@@ -102,7 +126,6 @@ def prompt_partition_style() -> str:
 class WindowsBackend:
     @staticmethod
     def check_dependencies() -> None:
-        """Verify PowerShell availability."""
         if not shutil.which("powershell"):
             print("ERROR: PowerShell is required on Windows systems but was not found in PATH.")
             sys.exit(1)
@@ -134,7 +157,7 @@ class WindowsBackend:
         return cp.returncode == 0 and cp.stdout.strip() == target_id
 
     @staticmethod
-    def wipe_and_partition(disk_id: str, style: str, partitions: List[Tuple[Optional[int], str, str]]) -> None:
+    def wipe_and_partition(disk_id: str, style: str, partitions: List[Tuple[Optional[int], str, str]], alloc_unit_bytes: int) -> None:
         style_param = "GPT" if style.lower() == "gpt" else "MBR"
         
         # Clear disk and set style
@@ -143,12 +166,16 @@ class WindowsBackend:
         if cp.returncode != 0:
             raise RuntimeError(f"Disk initialization failed:\n{cp.stderr}")
 
-        # Create partitions and format
+        # Create partitions and format with custom cluster size
         for size_mib, letter, label in partitions:
             size_arg = f"-Size {size_mib}MB" if size_mib else "-UseMaximumSize"
             letter_arg = f"-DriveLetter {letter}" if letter else ""
             
-            ps_part = f"New-Partition -DiskNumber {disk_id} {size_arg} {letter_arg} | Format-Volume -FileSystem exFAT -AllocationUnitSize {ALLOC_UNIT_BYTES} -NewFileSystemLabel '{label}' -Confirm:$false"
+            ps_part = (
+                f"New-Partition -DiskNumber {disk_id} {size_arg} {letter_arg} | "
+                f"Format-Volume -FileSystem exFAT -AllocationUnitSize {alloc_unit_bytes} "
+                f"-NewFileSystemLabel '{label}' -Confirm:$false"
+            )
             cp = run_cmd(["powershell", "-NoProfile", "-Command", ps_part])
             if cp.returncode != 0:
                 raise RuntimeError(f"Failed to create partition:\n{cp.stderr}")
@@ -161,19 +188,15 @@ class LinuxBackend:
 
     @classmethod
     def check_dependencies(cls) -> None:
-        """Verify essential Linux partition and filesystem binaries exist."""
         missing = [tool for tool in cls.REQUIRED_TOOLS if shutil.which(tool) is None]
-        
         if missing:
             print("\nERROR: Missing required system utilities for Linux mode:")
             for tool in missing:
                 print(f" - {tool}")
-            
-            print("\nPlease install the missing package(s) using your package manager:")
+            print("\nPlease install missing package(s):")
             print("  Ubuntu/Debian:  sudo apt install parted util-linux exfatprogs")
             print("  Fedora/RHEL:    sudo dnf install parted util-linux exfatprogs")
             print("  Arch Linux:     sudo pacman -S parted util-linux exfatprogs")
-            print("  openSUSE:       sudo zypper install parted util-linux exfatprogs")
             sys.exit(1)
 
     @staticmethod
@@ -199,7 +222,10 @@ class LinuxBackend:
         return root_dev.startswith(target_id)
 
     @staticmethod
-    def wipe_and_partition(disk_id: str, style: str, partitions: List[Tuple[Optional[int], str, str]]) -> None:
+    def wipe_and_partition(disk_id: str, style: str, partitions: List[Tuple[Optional[int], str, str]], alloc_unit_bytes: int) -> None:
+        # Calculate sectors per cluster for Linux mkfs.exfat (-s flag assumes 512-byte sector size)
+        sectors_per_cluster = max(1, alloc_unit_bytes // 512)
+
         # Wipe signatures
         run_cmd(["wipefs", "-a", disk_id])
 
@@ -222,43 +248,36 @@ class LinuxBackend:
             part_type = "primary"
             run_cmd(["parted", "-s", disk_id, "mkpart", part_type, "exfat", f"{start_mib}MiB", end_str])
             
-            # Predict partition node name (/dev/sdb1 vs /dev/nvme0n1p1)
             part_node = f"{disk_id}p{idx}" if any(c.isdigit() for c in disk_id[-1]) else f"{disk_id}{idx}"
             created_parts.append((part_node, label))
             
             if size_mib:
                 start_mib += size_mib
 
-        # Force kernel partition table reload
+        # Sync dev nodes
         run_cmd(["udevadm", "settle"])
 
-        # Format partitions
+        # Format partitions with chosen sector ratio
         for part_node, label in created_parts:
-            # -s 32 assigns 32 sectors per cluster (16 KB)
-            cmd = ["mkfs.exfat", "-s", "32", "-n", label, part_node]
+            cmd = ["mkfs.exfat", "-s", str(sectors_per_cluster), "-n", label, part_node]
             cp = run_cmd(cmd)
             if cp.returncode != 0:
-                raise RuntimeError(f"Failed to format {part_node}:\n{cp.stderr}\nEnsure 'exfatprogs' or 'exfat-utils' is installed.")
+                raise RuntimeError(f"Failed to format {part_node}:\n{cp.stderr}")
 
 
 # ----------------------------- Main Program Loop -----------------------------
 
 def main() -> None:
-    # 1. Ask Windows or Linux at start
     target_os = select_target_os()
     backend = WindowsBackend() if target_os == "Windows" else LinuxBackend()
 
     print(f"\n[Running in {target_os} Mode]")
-
-    # 2. Check binary dependencies
     backend.check_dependencies()
 
-    # 3. Privileges check
     if not is_root_or_admin(target_os):
-        print("WARNING: Insufficient privileges. Run this script as Administrator (Windows) or root/sudo (Linux).")
+        print("WARNING: Insufficient privileges. Run as Administrator (Windows) or root/sudo (Linux).")
         sys.exit(1)
 
-    # 4. Retrieve and list disks
     disks = backend.get_disks()
     if not disks:
         print("No configurable disks identified.")
@@ -276,7 +295,6 @@ def main() -> None:
         print("Invalid Disk Selection.")
         return
 
-    # 5. OS safety check
     if backend.is_system_disk(target_id):
         print("\nSAFETY WARNING: Target selected matches the ACTIVE OS Installation.")
         if not prompt_yes_no("Proceed despite safety override?", default=False):
@@ -285,9 +303,10 @@ def main() -> None:
             print("Operation aborted.")
             return
 
-    # 6. Partition details setup
+    # Choose partition setup & modular cluster size
     n_parts = prompt_int("\nNumber of partitions to construct (1-10): ", min_value=1, max_value=10)
     style = prompt_partition_style()
+    alloc_unit_bytes = prompt_cluster_size()
 
     partitions: List[Tuple[Optional[int], str, str]] = []
     used_letters: List[str] = []
@@ -318,7 +337,6 @@ def main() -> None:
 
         partitions.append((size_mib, letter, label))
 
-    # 7. Final execution
     confirm_msg = f"ERASE {target_id}"
     if input(f'\nType EXACTLY "{confirm_msg}" to perform operation: ').strip() != confirm_msg:
         print("Operation canceled.")
@@ -326,7 +344,7 @@ def main() -> None:
 
     print("\nWiping disk and applying filesystem configurations...")
     try:
-        backend.wipe_and_partition(target_id, style, partitions)
+        backend.wipe_and_partition(target_id, style, partitions, alloc_unit_bytes)
         print("\nDisk repartitioning and exFAT formatting completed successfully.")
     except Exception as e:
         print(f"\nExecution Error: {e}")
