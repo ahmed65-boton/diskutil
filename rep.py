@@ -9,6 +9,7 @@ import os
 import re
 import math
 import json
+import shutil
 import subprocess
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -100,6 +101,13 @@ def prompt_partition_style() -> str:
 
 class WindowsBackend:
     @staticmethod
+    def check_dependencies() -> None:
+        """Verify PowerShell availability."""
+        if not shutil.which("powershell"):
+            print("ERROR: PowerShell is required on Windows systems but was not found in PATH.")
+            sys.exit(1)
+
+    @staticmethod
     def get_disks() -> List[Dict[str, Any]]:
         ps = "Get-Disk | Select-Object Number, FriendlyName, Size, PartitionStyle | ConvertTo-Json"
         cp = run_cmd(["powershell", "-NoProfile", "-Command", ps])
@@ -149,6 +157,25 @@ class WindowsBackend:
 # ----------------------------- Linux Backend -----------------------------
 
 class LinuxBackend:
+    REQUIRED_TOOLS = ["lsblk", "parted", "wipefs", "udevadm", "mkfs.exfat"]
+
+    @classmethod
+    def check_dependencies(cls) -> None:
+        """Verify essential Linux partition and filesystem binaries exist."""
+        missing = [tool for tool in cls.REQUIRED_TOOLS if shutil.which(tool) is None]
+        
+        if missing:
+            print("\nERROR: Missing required system utilities for Linux mode:")
+            for tool in missing:
+                print(f" - {tool}")
+            
+            print("\nPlease install the missing package(s) using your package manager:")
+            print("  Ubuntu/Debian:  sudo apt install parted util-linux exfatprogs")
+            print("  Fedora/RHEL:    sudo dnf install parted util-linux exfatprogs")
+            print("  Arch Linux:     sudo pacman -S parted util-linux exfatprogs")
+            print("  openSUSE:       sudo zypper install parted util-linux exfatprogs")
+            sys.exit(1)
+
     @staticmethod
     def get_disks() -> List[Dict[str, Any]]:
         cp = run_cmd(["lsblk", "-dno", "NAME,MODEL,SIZE,BYTES,PTTYPE", "-b", "-J"])
@@ -223,12 +250,15 @@ def main() -> None:
 
     print(f"\n[Running in {target_os} Mode]")
 
-    # 2. Privileges check
+    # 2. Check binary dependencies
+    backend.check_dependencies()
+
+    # 3. Privileges check
     if not is_root_or_admin(target_os):
         print("WARNING: Insufficient privileges. Run this script as Administrator (Windows) or root/sudo (Linux).")
         sys.exit(1)
 
-    # 3. Retrieve and list disks
+    # 4. Retrieve and list disks
     disks = backend.get_disks()
     if not disks:
         print("No configurable disks identified.")
@@ -246,7 +276,7 @@ def main() -> None:
         print("Invalid Disk Selection.")
         return
 
-    # 4. OS safety check
+    # 5. OS safety check
     if backend.is_system_disk(target_id):
         print("\nSAFETY WARNING: Target selected matches the ACTIVE OS Installation.")
         if not prompt_yes_no("Proceed despite safety override?", default=False):
@@ -255,7 +285,7 @@ def main() -> None:
             print("Operation aborted.")
             return
 
-    # 5. Partition details setup
+    # 6. Partition details setup
     n_parts = prompt_int("\nNumber of partitions to construct (1-10): ", min_value=1, max_value=10)
     style = prompt_partition_style()
 
@@ -288,7 +318,7 @@ def main() -> None:
 
         partitions.append((size_mib, letter, label))
 
-    # 6. Final execution
+    # 7. Final execution
     confirm_msg = f"ERASE {target_id}"
     if input(f'\nType EXACTLY "{confirm_msg}" to perform operation: ').strip() != confirm_msg:
         print("Operation canceled.")
